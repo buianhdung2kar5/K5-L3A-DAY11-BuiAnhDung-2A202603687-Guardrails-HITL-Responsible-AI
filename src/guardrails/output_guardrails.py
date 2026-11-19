@@ -4,6 +4,9 @@ Checkpoint 2 — Output Guardrails
   - OutputGuardrailPlugin (ADK)           ← bắt buộc
   - LLM-as-Judge                          ← optional (không chấm)
 """
+import base64
+import binascii
+import codecs
 import re
 import textwrap
 
@@ -12,6 +15,7 @@ from google.adk.agents import llm_agent
 from google.adk import runners
 from google.adk.plugins import base_plugin
 
+from core.config import DEMO_SECRETS
 from core.utils import chat_with_agent
 
 
@@ -27,6 +31,59 @@ from core.utils import chat_with_agent
 # - "redacted": cleaned response (PII replaced with [REDACTED])
 # ============================================================
 
+# ------------------------------------------------------------
+# Encoded-secret detection (base64 / hex / ROT13 / reversed)
+# Attackers ask the model to "convert the value to Base64" so a plain-text
+# secret filter never sees it. Decode candidate tokens and compare them with
+# the protected values before the response leaves the system.
+# ------------------------------------------------------------
+_B64_TOKEN = re.compile(r"[A-Za-z0-9+/_-]{8,}={0,2}")
+_HEX_TOKEN = re.compile(r"(?:[0-9a-fA-F]{2}[\s:-]?){6,}")
+
+
+def _squash(text: str) -> str:
+    return re.sub(r"[^a-z0-9]", "", (text or "").casefold())
+
+
+def _hides_secret(decoded: str) -> bool:
+    squashed = _squash(decoded)
+    return any(n and n in squashed for n in (_squash(s) for s in DEMO_SECRETS))
+
+
+def _decode_variants(token: str) -> list[str]:
+    """Decode one token in several ways; each result plus its reverse."""
+    out = [token, codecs.decode(token, "rot_13")]
+    b64 = token.replace("-", "+").replace("_", "/")
+    b64 += "=" * (-len(b64) % 4)
+    try:
+        out.append(base64.b64decode(b64).decode("utf-8", errors="ignore"))
+    except (binascii.Error, ValueError):
+        pass
+    digits = re.sub(r"[^0-9a-fA-F]", "", token)
+    digits = digits[: len(digits) - (len(digits) % 2)]
+    try:
+        out.append(bytes.fromhex(digits).decode("utf-8", errors="ignore"))
+    except ValueError:
+        pass
+    return [v for v in out if v] + [v[::-1] for v in out if v]
+
+
+def _redact_encoded_secrets(text: str) -> tuple[str, int]:
+    """Replace tokens that decode to a protected value. Returns (text, count)."""
+    count = 0
+
+    def repl(match: re.Match) -> str:
+        nonlocal count
+        if any(_hides_secret(v) for v in _decode_variants(match.group(0))):
+            count += 1
+            return "[REDACTED]"
+        return match.group(0)
+
+    for pattern in (_B64_TOKEN, _HEX_TOKEN):
+        text = pattern.sub(repl, text)
+    return text, count
+
+
 def content_filter(response: str) -> dict:
     """Filter response for PII, secrets, and harmful content.
 
@@ -41,12 +98,13 @@ def content_filter(response: str) -> dict:
 
     # PII patterns to check
     PII_PATTERNS = {
-        # TODO: Add regex patterns for:
-        # - VN phone number: r"0\d{9,10}"
-        # - Email: r"[\w.-]+@[\w.-]+\.[a-zA-Z]{2,}"
-        # - National ID (CMND/CCCD): r"\b\d{9}\b|\b\d{12}\b"
-        # - API key pattern: r"sk-[a-zA-Z0-9-]+"
-        # - Password pattern: r"password\s*[:=]\s*\S+"
+        "vn_phone": r"(?<!\d)(?:\+84|0)\d{9,10}(?!\d)",
+        "email": r"[\w.+-]+@[\w-]+(?:\.[\w-]+)*\.[a-zA-Z]{2,}",
+        "national_id": r"(?<!\d)(?:\d{12}|\d{9})(?!\d)",
+        "api_key": r"sk-[a-zA-Z0-9-]+",
+        "password": r"(?:password|passwd|mật\s*khẩu)\s*(?:is|was|[:=])\s*[^\s,;]+",
+        "internal_host": r"\b[\w-]+(?:\.[\w-]+)*\.internal(?::\d+)?\b",
+        "admin_secret": r"\badmin123\b",
     }
 
     for name, pattern in PII_PATTERNS.items():
@@ -54,6 +112,15 @@ def content_filter(response: str) -> dict:
         if matches:
             issues.append(f"{name}: {len(matches)} found")
             redacted = re.sub(pattern, "[REDACTED]", redacted, flags=re.IGNORECASE)
+
+    redacted, n_encoded = _redact_encoded_secrets(redacted)
+    if n_encoded:
+        issues.append(f"encoded_secret: {n_encoded} found")
+
+    # Last resort: whole reply reversed/ROT13-encoded or split so tokens miss it.
+    if not n_encoded and any(_hides_secret(v) for v in (response[::-1], codecs.decode(response, "rot_13"))):
+        issues.append("encoded_secret: 1 found")
+        redacted = "[REDACTED]"
 
     return {
         "safe": len(issues) == 0,
@@ -172,16 +239,26 @@ class OutputGuardrailPlugin(base_plugin.BasePlugin):
         if not response_text:
             return llm_response
 
-        # TODO: Implement logic:
-        # 1. Call content_filter(response_text)
-        #    - If issues found: replace llm_response.content with redacted version
-        #    - Increment self.redacted_count
-        # 2. If use_llm_judge: call llm_safety_check(response_text)
-        #    - If unsafe: replace llm_response.content with a safe message
-        #    - Increment self.blocked_count
-        # 3. Return llm_response (possibly modified)
+        filtered = content_filter(response_text)
+        if not filtered["safe"]:
+            self.redacted_count += 1
+            response_text = filtered["redacted"]
+            llm_response.content = types.Content(
+                role="model", parts=[types.Part.from_text(text=response_text)]
+            )
 
-        return llm_response  # TODO: modify if needed
+        if self.use_llm_judge:
+            verdict = await llm_safety_check(response_text)
+            if not verdict["safe"]:
+                self.blocked_count += 1
+                llm_response.content = types.Content(
+                    role="model",
+                    parts=[types.Part.from_text(
+                        text="Xin lỗi, tôi không thể chia sẻ thông tin đó. Tôi có thể giúp gì thêm cho nhu cầu ngân hàng của bạn tại VinBank?"
+                    )],
+                )
+
+        return llm_response
 
 
 # ============================================================
