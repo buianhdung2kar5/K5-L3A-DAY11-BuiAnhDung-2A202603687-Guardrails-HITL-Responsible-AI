@@ -11,6 +11,7 @@ Status convention (không dùng True/False mơ hồ):
 from __future__ import annotations
 
 import re
+import unicodedata
 from typing import Literal
 
 from google.genai import types
@@ -51,16 +52,72 @@ def detect_injection(user_input: str) -> InputStatus:
     Returns:
         ``"BLOCK"`` if injection detected (chặn), ``"ALLOW"`` otherwise (cho qua).
     """
-    INJECTION_PATTERNS = [
-        # TODO: Add at least 5 regex patterns
-        # Example:
-        # r"ignore (all )?(previous|above) instructions",
-    ]
-
+    text = _canonicalize(user_input)
+    views = (text, _strip_accents(text))  # accented + accent-stripped (for Vietnamese)
     for pattern in INJECTION_PATTERNS:
-        if re.search(pattern, user_input, re.IGNORECASE):
+        if any(re.search(pattern, v, re.IGNORECASE) for v in views):
             return "BLOCK"
+    if re.search(r"\bDAN\b", text):  # tên persona viết hoa, chỉ trên văn bản gốc
+        return "BLOCK"
     return "ALLOW"
+
+
+# Invisible characters an attacker can insert to split keywords ("Ignore​ all").
+_INVISIBLE_CHARS = dict.fromkeys(
+    map(ord, "​‌‍‎‏⁠⁡⁢⁣﻿­"), None
+)
+
+
+def _canonicalize(text: str) -> str:
+    """NFKC-normalize, drop invisible chars, collapse whitespace."""
+    text = unicodedata.normalize("NFKC", text or "")
+    text = text.translate(_INVISIBLE_CHARS)
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def _strip_accents(text: str) -> str:
+    """'tài khoản' -> 'tai khoan' so Vietnamese matches the unaccented topic lists."""
+    text = unicodedata.normalize("NFD", text.casefold().replace("đ", "d"))
+    return "".join(c for c in text if unicodedata.category(c) != "Mn")
+
+
+INJECTION_PATTERNS = [
+    # Override / ignore previous rules
+    r"(ignore|disregard|forget|override|bypass)\s+(all\s+|any\s+|your\s+)?(the\s+)?"
+    r"(previous|above|prior|earlier|system|safety)?\s*(instructions?|rules?|prompts?|guidelines?|directives?)",
+    # Role / persona change
+    r"\byou\s+are\s+now\b",
+    r"\bpretend\s+(you\s+are|to\s+be|you're)\b",
+    r"\bact\s+as\s+(a\s+|an\s+)?(unrestricted|unfiltered|evil|jailbroken|different)",
+    r"\broleplay\s+as\b|\brole\s*-?\s*play\s+as\b",
+    # "DAN" được xử lý riêng (phân biệt hoa/thường) trong detect_injection: nếu để ở đây, bản đã bỏ dấu
+    # của "hướng dẫn" ("huong dan") sẽ khớp nhầm.
+    r"\b(developer\s+mode|jailbreak(ed)?|god\s+mode|do\s+anything\s+now)\b",
+    # System prompt / instruction extraction
+    r"\bsystem\s+prompt\b",
+    r"\b(reveal|show|print|repeat|output|display|leak|translate)\b.{0,30}"
+    r"\b(your\s+)?(instructions?|prompt|configuration|config|rules)\b",
+    # Credential extraction
+    r"\b(reveal|show|tell|give|share|print|leak|what\s*(is|'s)|dump)\b.{0,30}"
+    r"\b(admin|root|system|internal|database|db)\b.{0,15}\b(password|credentials?|api\s*key|secret|host)\b",
+    r"\bapi[\s_-]*key\b.{0,20}\b(is|=|:)\b",
+    # Credential field names (snake_case tokens, e.g. "admin_credential")
+    r"(admin|root|system|internal|db|database|api)[_-](credentials?|password|passwd|secret|key|token|host)",
+    # Asking to re-encode a secret/config value (base64/hex/rot13) to dodge output filters
+    r"\b(base\s*64|hex(adecimal)?|rot\s*-?13)\b.{0,80}(credential|secret|password|api[\s_-]*key|config)",
+    r"(credential|secret|password|api[\s_-]*key|config).{0,80}\b(base\s*64|hex(adecimal)?|rot\s*-?13)\b",
+    # SQL injection payloads (e.g. "'; DROP TABLE accounts; --")
+    r"\b(drop|truncate)\s+(table|database|schema)\b",
+    r";\s*(drop|delete|truncate|alter|insert|update|select|exec)\b",
+    r"\bunion\s+(all\s+)?select\b",
+    r"['\"]\s*or\s+['\"]?\w+['\"]?\s*=\s*['\"]?\w+",
+    r"(;|')\s*--",
+    # Vietnamese (matched on the accent-stripped text, see detect_injection)
+    r"bo\s*qua\s+(moi\s+|tat\s+ca\s+)?(huong\s+dan|quy\s+tac|chi\s+thi)",
+    r"quen\s+(moi\s+|tat\s+ca\s+)?(huong\s+dan|quy\s+tac)",
+    r"tiet\s+lo\s+(mat\s+khau|system\s*prompt|api)",
+    r"(cho\s+toi\s+xem|hien\s+thi)\s+(system\s*prompt|mat\s+khau)",
+]
 
 
 # ============================================================
@@ -84,14 +141,19 @@ def topic_filter(user_input: str) -> InputStatus:
         ``"BLOCK"`` = chặn (off-topic hoặc topic cấm).
         ``"ALLOW"`` = cho qua (câu banking hợp lệ).
     """
-    input_lower = user_input.lower()
+    text = _strip_accents(_canonicalize(user_input))
+    if not text:
+        return "BLOCK"
 
-    # TODO: Implement logic:
-    # 1. If input contains any blocked topic -> return "BLOCK"
-    # 2. If input doesn't contain any allowed topic -> return "BLOCK"
-    # 3. Otherwise -> return "ALLOW"
+    def has_topic(topic: str) -> bool:
+        # Word-prefix match: "hack" hits "hacking" but "skill" does not hit "kill".
+        return re.search(r"\b" + re.escape(_strip_accents(topic)), text) is not None
 
-    pass  # Replace with your implementation
+    if any(has_topic(t) for t in BLOCKED_TOPICS):
+        return "BLOCK"
+    if not any(has_topic(t) for t in ALLOWED_TOPICS):
+        return "BLOCK"
+    return "ALLOW"
 
 
 # ============================================================
@@ -104,6 +166,71 @@ def topic_filter(user_input: str) -> InputStatus:
 #   - user_message is types.Content (not str)
 #   - Return types.Content to block, or None to pass through
 # ============================================================
+
+# ============================================================
+# Câu trả lời cố định (tiếng Việt) — các yêu cầu này bị chặn TRƯỚC khi gọi LLM,
+# nên không tốn API và không phụ thuộc vào việc model có tự từ chối hay không.
+# ============================================================
+
+MSG_INJECTION = (
+    "Xin lỗi, tôi không thể xử lý yêu cầu này. "
+    "Tôi chỉ hỗ trợ các câu hỏi về dịch vụ ngân hàng của VinBank."
+)
+MSG_HARMFUL = (
+    "Xin lỗi, tôi không thể hỗ trợ yêu cầu này vì nó có thể vi phạm pháp luật hoặc đạo đức. "
+    "Tôi có thể giúp bạn về tài khoản, chuyển tiền, tiết kiệm, vay vốn hoặc thẻ tín dụng."
+)
+MSG_OFF_TOPIC = (
+    "Tôi là trợ lý của VinBank nên chỉ có thể hỗ trợ các câu hỏi liên quan đến ngân hàng, "
+    "như tài khoản, giao dịch, tiết kiệm, vay vốn và thẻ tín dụng."
+)
+
+# Nội dung độc hại / vi phạm đạo đức, định nghĩa sẵn. Khớp trên văn bản đã bỏ dấu, chữ thường.
+HARMFUL_PATTERNS = [
+    # tấn công mạng / xâm nhập
+    r"\bhack\w*", r"\bcrack(?:ing|er)?\b", r"\bddos\b",
+    r"\b(?:malware|ransomware|keylogger|phishing|spyware)\b",
+    r"(?:bypass|vuot|qua\s+mat).{0,20}(?:otp|2fa|xac\s+thuc)",
+    # trốn thuế / gian lận thuế
+    r"tax\s+evasion|evade\s+(?:the\s+)?tax\w*|tron\s+thue|lach\s+thue|khai\s+man|giau\s+thu\s+nhap",
+    # rửa tiền
+    r"money\s+launder\w*|launder\w*\s+money|rua\s+tien",
+    # làm giả / giả mạo
+    r"counterfeit|forg(?:e|ing)\s+(?:a\s+)?(?:check|cheque|signature|document|id)|tien\s+gia|lam\s+gia|gia\s+mao",
+    # trộm cắp / lừa đảo
+    r"\b(?:steal|stealing|thief)\b|an\s+trom|an\s+cap|danh\s+cap|trom\s+(?:tien|the|tai\s+khoan)",
+    # (lừa đảo: xem FRAUD_INTENT_PATTERNS — cần phân biệt "cách lừa đảo" với "cách tránh bị lừa đảo")
+    # bạo lực, vũ khí, ma túy, cờ bạc
+    r"\b(?:bomb|weapon|explosive)s?\b|vu\s+khi|\bbom\b|\bma\s+tuy\b|\bdrugs?\b",
+    r"\bkill\w*|\bgiet\b",
+    r"\bgambl\w*|co\s+bac|ca\s+do|danh\s+bac",
+]
+
+
+# Ý định thực hiện lừa đảo. Bỏ qua nếu câu hỏi mang tính phòng tránh / báo cáo (câu hỏi hợp lệ của khách).
+FRAUD_INTENT_PATTERNS = [
+    r"(?:commit|run|carry\s+out|how\s+to\s+do)\s+(?:a\s+)?(?:fraud|scam)",
+    r"(?:cach|lam\s+sao).{0,20}(?:lua\s+dao|lua\s+tien|gian\s+lan)",
+]
+PROTECTIVE_PATTERN = (
+    r"\b(?:tranh|phong\s+(?:chong|ngua)|chong|bao\s+ve|nhan\s+biet|bi\s+lua|bao\s+cao|"
+    r"report|protect|avoid|prevent|detect|recogni[sz]e)\b"
+)
+
+
+def harmful_filter(user_input: str) -> InputStatus:
+    """``"BLOCK"`` nếu câu hỏi nhằm vào việc phạm pháp / vi phạm đạo đức, ngược lại ``"ALLOW"``.
+
+    Chạy trước topic_filter: câu như "cách trốn thuế khi chuyển tiền ngân hàng" có từ khóa
+    banking nên sẽ lọt topic_filter, nhưng vẫn phải bị chặn.
+    """
+    text = _strip_accents(_canonicalize(user_input))
+    if any(re.search(p, text) for p in HARMFUL_PATTERNS):
+        return "BLOCK"
+    if any(re.search(p, text) for p in FRAUD_INTENT_PATTERNS) and not re.search(PROTECTIVE_PATTERN, text):
+        return "BLOCK"
+    return "ALLOW"
+
 
 class InputGuardrailPlugin(base_plugin.BasePlugin):
     """Plugin that blocks bad input before it reaches the LLM."""
@@ -144,14 +271,16 @@ class InputGuardrailPlugin(base_plugin.BasePlugin):
         self.total_count += 1
         text = self._extract_text(user_message)
 
-        # TODO: Implement logic:
-        # 1. Call detect_injection(text)
-        #    - If "BLOCK": increment blocked_count, return self._block_response("...")
-        # 2. Call topic_filter(text)
-        #    - If "BLOCK": increment blocked_count, return self._block_response("...")
-        # 3. If both return "ALLOW": return None (let message through)
-
-        pass  # Replace with your implementation
+        if detect_injection(text) == "BLOCK":
+            self.blocked_count += 1
+            return self._block_response(MSG_INJECTION)
+        if harmful_filter(text) == "BLOCK":
+            self.blocked_count += 1
+            return self._block_response(MSG_HARMFUL)
+        if topic_filter(text) == "BLOCK":
+            self.blocked_count += 1
+            return self._block_response(MSG_OFF_TOPIC)
+        return None
 
 
 # ============================================================
